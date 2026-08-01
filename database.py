@@ -4,15 +4,18 @@ PostgreSQL Database Models and Connection Manager
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from sqlalchemy.pool import NullPool
 import logging
 
 Base = declarative_base()
 logger = logging.getLogger(__name__)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
 class Account(Base):
@@ -29,8 +32,8 @@ class Account(Base):
     status = Column(String(50), default='Added')
     session_file = Column(String(255), nullable=False)
     session_string = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     def to_dict(self):
         """Convert to dictionary for compatibility with existing code"""
@@ -61,8 +64,8 @@ class ScheduledPost(Base):
     posts_data = Column(JSON, nullable=False)  # {phone: [{channel, post_id}]}
     scheduled_datetime = Column(DateTime, nullable=False, index=True)
     status = Column(String(50), default='Pending', index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     sent_at = Column(DateTime, nullable=True)
     error_message = Column(Text, nullable=True)
 
@@ -147,7 +150,7 @@ class DatabaseManager:
             raise
 
     def _ensure_correct_schema(self):
-        """Ensure database schema is correct, drop and recreate if needed"""
+        """Ensure database schema is correct safely without dropping tables"""
         try:
             from sqlalchemy import inspect, text
 
@@ -157,13 +160,13 @@ class DatabaseManager:
             if 'scheduled_posts' in inspector.get_table_names():
                 columns = [col['name'] for col in inspector.get_columns('scheduled_posts')]
 
-                # If posts_data column doesn't exist, drop the table
+                # If posts_data column doesn't exist, safely alter table
                 if 'posts_data' not in columns:
-                    logger.warning("⚠️  Scheduled posts table has old schema, dropping and recreating...")
+                    logger.warning("⚠️  Scheduled posts table missing posts_data column, adding column...")
                     with self.engine.connect() as conn:
-                        conn.execute(text('DROP TABLE IF EXISTS scheduled_posts CASCADE'))
+                        conn.execute(text('ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS posts_data JSON'))
                         conn.commit()
-                    logger.info("✅ Old scheduled_posts table dropped")
+                    logger.info("✅ Column posts_data added safely")
 
         except Exception as e:
             logger.warning(f"⚠️  Schema check failed (continuing): {str(e)}")
@@ -174,6 +177,14 @@ class DatabaseManager:
             raise RuntimeError("Database not connected!")
         return self.Session()
 
+    def _cleanup_session(self):
+        """Remove scoped session thread-local binding"""
+        if self.Session:
+            try:
+                self.Session.remove()
+            except Exception:
+                pass
+
     # ==================== ACCOUNTS OPERATIONS ====================
 
     def get_all_accounts(self):
@@ -183,7 +194,7 @@ class DatabaseManager:
             accounts = session.query(Account).all()
             return [acc.to_dict() for acc in accounts]
         finally:
-            session.close()
+            self._cleanup_session()
 
     def get_account_by_phone(self, phone):
         """Get account by phone number"""
@@ -192,7 +203,7 @@ class DatabaseManager:
             account = session.query(Account).filter_by(phone=phone).first()
             return account.to_dict() if account else None
         finally:
-            session.close()
+            self._cleanup_session()
 
     def add_account(self, account_data):
         """Add new account"""
@@ -218,7 +229,7 @@ class DatabaseManager:
             logger.error(f"❌ Failed to add account: {str(e)}")
             raise
         finally:
-            session.close()
+            self._cleanup_session()
 
     def update_account(self, phone, updates):
         """Update account by phone"""
@@ -234,7 +245,7 @@ class DatabaseManager:
                 elif hasattr(account, key):
                     setattr(account, key, value)
 
-            account.updated_at = datetime.utcnow()
+            account.updated_at = utc_now()
             session.commit()
             logger.info(f"✅ Account updated: {phone}")
             return account.to_dict()
@@ -243,7 +254,7 @@ class DatabaseManager:
             logger.error(f"❌ Failed to update account: {str(e)}")
             raise
         finally:
-            session.close()
+            self._cleanup_session()
 
     def delete_account(self, phone):
         """Delete account by phone"""
@@ -261,7 +272,7 @@ class DatabaseManager:
             logger.error(f"❌ Failed to delete account: {str(e)}")
             raise
         finally:
-            session.close()
+            self._cleanup_session()
 
     # ==================== SCHEDULED POSTS OPERATIONS ====================
 
@@ -272,7 +283,7 @@ class DatabaseManager:
             posts = session.query(ScheduledPost).order_by(ScheduledPost.scheduled_datetime).all()
             return [post.to_dict() for post in posts]
         finally:
-            session.close()
+            self._cleanup_session()
 
     def get_pending_posts(self):
         """Get pending scheduled posts"""
@@ -281,7 +292,7 @@ class DatabaseManager:
             posts = session.query(ScheduledPost).filter_by(status='Pending').order_by(ScheduledPost.scheduled_datetime).all()
             return [post.to_dict() for post in posts]
         finally:
-            session.close()
+            self._cleanup_session()
 
     def get_scheduled_post_by_id(self, post_id):
         """Get scheduled post by ID"""
@@ -290,7 +301,7 @@ class DatabaseManager:
             post = session.query(ScheduledPost).filter_by(id=post_id).first()
             return post.to_dict() if post else None
         finally:
-            session.close()
+            self._cleanup_session()
 
     def add_scheduled_post(self, post_data):
         """Add new scheduled post"""
@@ -310,7 +321,7 @@ class DatabaseManager:
             logger.error(f"❌ Failed to add scheduled post: {str(e)}")
             raise
         finally:
-            session.close()
+            self._cleanup_session()
 
     def update_scheduled_post(self, post_id, updates):
         """Update scheduled post"""
@@ -328,7 +339,7 @@ class DatabaseManager:
                 elif hasattr(post, key):
                     setattr(post, key, value)
 
-            post.updated_at = datetime.utcnow()
+            post.updated_at = utc_now()
             session.commit()
             return post.to_dict()
         except Exception as e:
@@ -336,7 +347,7 @@ class DatabaseManager:
             logger.error(f"❌ Failed to update post: {str(e)}")
             raise
         finally:
-            session.close()
+            self._cleanup_session()
 
     def delete_scheduled_post(self, post_id):
         """Delete scheduled post"""
@@ -354,12 +365,12 @@ class DatabaseManager:
             logger.error(f"❌ Failed to delete post: {str(e)}")
             raise
         finally:
-            session.close()
+            self._cleanup_session()
 
     # ==================== MIGRATION HELPERS ====================
 
     def migrate_from_json(self, json_file_path):
-        """Migrate accounts from JSON file to PostgreSQL"""
+        """Migrate accounts from JSON file to PostgreSQL safely"""
         if not os.path.exists(json_file_path):
             logger.warning(f"JSON file not found: {json_file_path}")
             return 0
@@ -368,9 +379,15 @@ class DatabaseManager:
             with open(json_file_path, 'r', encoding='utf-8') as f:
                 accounts_data = json.load(f)
 
+            if not isinstance(accounts_data, list):
+                logger.warning(f"JSON file does not contain a list of accounts")
+                return 0
+
             migrated = 0
             for account_data in accounts_data:
                 try:
+                    if not isinstance(account_data, dict) or 'phone' not in account_data:
+                        continue
                     # Check if account already exists
                     existing = self.get_account_by_phone(account_data['phone'])
                     if existing:
@@ -385,13 +402,16 @@ class DatabaseManager:
             logger.info(f"✅ Migrated {migrated} accounts from JSON to PostgreSQL")
             return migrated
         except Exception as e:
-            logger.error(f"❌ Migration failed: {str(e)}")
-            raise
+            logger.error(f"❌ Migration skipped due to format error: {str(e)}")
+            return 0
 
     def close(self):
         """Close database connections"""
         if self.Session:
-            self.Session.remove()
+            try:
+                self.Session.remove()
+            except Exception:
+                pass
         if self.engine:
             self.engine.dispose()
         self.connected = False

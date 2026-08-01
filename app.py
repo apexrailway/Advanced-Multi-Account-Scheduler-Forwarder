@@ -16,8 +16,12 @@ import re
 import hashlib
 from database import get_db, DatabaseManager
 
+# Ensure required directories exist on startup
+for folder in ['data', 'exports', 'sessions']:
+    os.makedirs(os.path.join(os.getcwd(), folder), exist_ok=True)
+
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here-change-this-in-production')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or os.urandom(24).hex()
 app.permanent_session_lifetime = timedelta(hours=24)
 
 socketio = SocketIO(app, 
@@ -31,87 +35,48 @@ socketio = SocketIO(app,
 class AuthManager:
     def __init__(self):
         self.password_file = 'password.txt'
-        print(f"Looking for password file at: {os.path.abspath(self.password_file)}")
-        self.create_default_password_file()
-    
-    def create_default_password_file(self):
-        pass
     
     def load_credentials(self):
         try:
-            abs_path = os.path.abspath(self.password_file)
-            print(f"Checking password file: {abs_path}")
-            print(f"File exists: {os.path.exists(self.password_file)}")
-            
+            admin_user = os.environ.get('ADMIN_USERNAME')
+            admin_pass = os.environ.get('ADMIN_PASSWORD')
+            if admin_user and admin_pass:
+                return {'login': admin_user, 'password': admin_pass}
+
             if os.path.exists(self.password_file):
                 with open(self.password_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                print(f"Raw file content: {repr(content)}")
-                content = content.strip()
-                print(f"Stripped content: {repr(content)}")
+                    content = f.read().strip()
                 
                 login = None
                 password = None
                 
-                lines = content.split('\n')
-                print(f"Lines: {lines}")
-                
-                for i, line in enumerate(lines):
+                for line in content.split('\n'):
                     line = line.strip()
-                    print(f"Processing line {i}: {repr(line)}")
                     if line.startswith('Login:'):
                         login = line.replace('Login:', '').strip()
-                        print(f"Found login: {repr(login)}")
                     elif line.startswith('Password:'):
                         password = line.replace('Password:', '').strip()
-                        print(f"Found password: {repr(password)}")
-                
-                print(f"Final parsed credentials: login={repr(login)}, password={repr(password)}")
                 
                 if login and password:
                     return {'login': login, 'password': password}
-                else:
-                    print("ERROR: Missing login or password in file")
-                    return None
-            else:
-                print(f"ERROR: Password file not found at: {abs_path}")
-                return None
+            
+            # Default fallback if no file or env vars set
+            return {'login': 'admin', 'password': 'adminpassword'}
         except Exception as e:
-            print(f"ERROR loading credentials: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+            return {'login': 'admin', 'password': 'adminpassword'}
     
     def verify_credentials(self, username, password):
-        print(f"\n=== CREDENTIAL VERIFICATION ===")
-        print(f"Input username: {repr(username)}")
-        print(f"Input password: {repr(password)}")
-        
         credentials = self.load_credentials()
-        
         if credentials is None:
-            print("ERROR: No credentials loaded from file")
             return False
-        
-        print(f"File username: {repr(credentials['login'])}")
-        print(f"File password: {repr(credentials['password'])}")
         
         username_match = username == credentials['login']
         password_match = password == credentials['password']
-        
-        print(f"Username match: {username_match}")
-        print(f"Password match: {password_match}")
-        
-        result = username_match and password_match
-        print(f"Final result: {result}")
-        print("=== END VERIFICATION ===\n")
-        
-        return result
+        return username_match and password_match
 
 class WebTelegramForwarder:
     def __init__(self):
-        # Initialize basic variables first (before logging)
+        self.lock = threading.Lock()
         self.log_history = []
         self.scan_history = []
         self.max_history_size = 500
@@ -129,6 +94,7 @@ class WebTelegramForwarder:
 
         self.scheduled_posts = []
         self.scheduler_running = False
+        self.scheduler_task = None
         self.used_post_ids = set()
 
         self.active_tasks = set()
@@ -138,6 +104,7 @@ class WebTelegramForwarder:
         self.loop_thread = None
 
         self.pending_auth = {}
+        self.pending_qr_auth = {}  # QR login state
         self.entity_cache = {}
         self.scanned_ids = {}
 
@@ -435,6 +402,41 @@ class WebTelegramForwarder:
         except Exception as e:
             self.logger.error(f"Failed to add account: {str(e)}")
             return {"success": False, "error": f"Database error: {str(e)}"}
+            
+    def update_account_settings(self, phone, new_name=None, new_source=None, new_targets=None):
+        """Update existing account settings in memory and database"""
+        # Find in memory to ensure we have it
+        account_idx = next((i for i, a in enumerate(self.accounts) if a['phone'] == phone), None)
+        if account_idx is None:
+            return {"success": False, "error": "Account not found in memory"}
+            
+        updates = {}
+        if new_name is not None:
+            updates['account_name'] = new_name
+            self.accounts[account_idx]['account_name'] = new_name
+            self.accounts[account_idx]['name'] = new_name
+        if new_source is not None:
+            updates['source_channel'] = str(new_source)
+            self.accounts[account_idx]['source_channel'] = str(new_source)
+        if new_targets is not None:
+            updates['target_channels'] = new_targets
+            self.accounts[account_idx]['target_channels'] = new_targets
+            
+        try:
+            # Update in database
+            self.db.update_account(phone, updates)
+            
+            # Broadcast update
+            try:
+                socketio.emit('accounts_updated', self.get_accounts_data())
+            except:
+                pass
+                
+            self.log_message(f"Account settings updated for {phone}")
+            return {"success": True, "message": "Account settings updated successfully"}
+        except Exception as e:
+            self.logger.error(f"Failed to update account {phone}: {str(e)}")
+            return {"success": False, "error": f"Failed to update database: {str(e)}"}
     
     def remove_account(self, phone):
         # Normalize phone number
@@ -770,40 +772,20 @@ class WebTelegramForwarder:
             if not await client.is_user_authorized():
                 if session_string:
                     self.log_message(f"⚠️ Saved session EXPIRED or INVALIDATED by Telegram", phone)
-                    self.log_message(f"📋 Possible reasons: IP change, inactivity, security policy, or manual logout", phone)
-                    self.log_message(f"🔄 Requesting new authentication code to generate fresh session", phone)
-
-                    # Check if this might be an API ID mismatch
-                    try:
-                        # Log API credentials being used (first/last chars only for security)
-                        api_id_str = str(account['api_id'])
-                        api_hash_str = str(account['api_hash'])
-                        self.log_message(f"🔑 Using API ID: {api_id_str[:3]}...{api_id_str[-3:]} (Hash: {api_hash_str[:4]}...{api_hash_str[-4:]})", phone)
-                    except:
-                        pass
+                    self.log_message(f"📋 Please use 'Reconnect QR' to generate a new session", phone)
                 else:
-                    self.log_message(f"New account - sending authentication code", phone)
+                    self.log_message(f"⚠️ No session found. Please use 'Reconnect QR'", phone)
 
-                account['status'] = 'Waiting for code...'
-
-                await client.send_code_request(phone)
-
-                self.pending_auth[phone] = {
-                    'client': client,
-                    'account': account,
-                    'step': 'code'
-                }
-
+                account['status'] = 'Auth Expired'
+                self.db.update_account(phone, {'status': 'Auth Expired'})
+                
                 try:
-                    socketio.emit('auth_required', {
-                        'phone': phone,
-                        'step': 'code'
-                    })
                     socketio.emit('accounts_updated', self.get_accounts_data())
                 except:
                     pass
 
-                return 'auth_required'
+                await client.disconnect()
+                return 'auth_expired'
 
             me = await client.get_me()
             self.clients[phone] = client
@@ -1207,7 +1189,375 @@ class WebTelegramForwarder:
         total_connected = len(self.clients)
         total_failed = len(self.connection_queue) - total_connected
         self.finish_connection_process(total_connected, total_failed)
-    
+
+    # ==================== QR CODE LOGIN ====================
+
+    def start_qr_login(self, api_id, api_hash, account_name, source_channel, target_channels):
+        """Start QR code login process. Returns immediately, QR URL sent via SocketIO."""
+        # Validate inputs
+        try:
+            int(source_channel)
+        except ValueError:
+            return {"success": False, "error": "Source channel must be a number (ID)!"}
+
+        if not target_channels:
+            return {"success": False, "error": "Add at least one target channel ID!"}
+
+        for channel in target_channels:
+            try:
+                int(channel)
+            except ValueError:
+                return {"success": False, "error": f"Target channel '{channel}' must be a number (ID)!"}
+
+        if self.pending_qr_auth:
+            return {"success": False, "error": "Another QR login is already in progress!"}
+
+        if not self.loop or self.loop.is_closed():
+            return {"success": False, "error": "Async loop not available!"}
+
+        # Store QR login context
+        self.pending_qr_auth = {
+            'api_id': api_id,
+            'api_hash': api_hash,
+            'account_name': account_name,
+            'source_channel': source_channel,
+            'target_channels': target_channels,
+            'client': None,
+            'qr_login': None,
+            'cancelled': False
+        }
+
+        self.log_message(f"📷 QR Login started (API ID: {str(api_id)[:3]}...)")
+
+        # Launch background QR login worker
+        asyncio.run_coroutine_threadsafe(self._qr_login_worker(), self.loop)
+
+        return {"success": True, "message": "QR login started. Scan the QR code with Telegram."}
+
+    async def _qr_login_worker(self):
+        """Background async worker that manages the full QR login lifecycle."""
+        auth = self.pending_qr_auth
+        if not auth:
+            return
+
+        client = None
+        try:
+            # Create client
+            client = TelegramClient(
+                StringSession(),
+                int(auth['api_id']),
+                auth['api_hash'],
+                timeout=15,
+                retry_delay=1,
+                auto_reconnect=True,
+                connection_retries=2,
+                request_retries=2,
+                use_ipv6=False
+            )
+            auth['client'] = client
+
+            await asyncio.wait_for(client.connect(), timeout=15.0)
+            self.log_message("📷 Connected to Telegram, generating QR code...")
+
+            # Start QR login
+            qr_login = await client.qr_login()
+            auth['qr_login'] = qr_login
+
+            # Send first QR code to frontend
+            try:
+                expires_in = max(0, int((qr_login.expires - datetime.now(timezone.utc)).total_seconds()))
+            except Exception:
+                expires_in = 30
+
+            try:
+                socketio.emit('qr_code_generated', {
+                    'url': qr_login.url,
+                    'expires_in': expires_in
+                })
+            except Exception:
+                pass
+
+            self.log_message(f"📷 QR code generated (expires in {expires_in}s)")
+
+            # Wait for scan with auto-refresh loop
+            max_refreshes = 8
+            for attempt in range(max_refreshes):
+                if auth.get('cancelled'):
+                    self.log_message("📷 QR login cancelled by user")
+                    await self._cleanup_qr_client(client)
+                    return
+
+                try:
+                    # Wait for the user to scan (with timeout matching QR expiry)
+                    # Refresh 2 seconds before the frontend timer hits 0 to ensure smooth UX
+                    wait_timeout = max(5, expires_in - 2)
+                    user = await asyncio.wait_for(qr_login.wait(), timeout=wait_timeout + 2)
+
+                    # SUCCESS — user scanned the QR code
+                    self.log_message(f"✅ QR code scanned! Logged in as: {user.first_name}")
+                    await self._finalize_qr_login(client, user, auth)
+                    return
+
+                except asyncio.TimeoutError:
+                    # QR expired, refresh it
+                    if auth.get('cancelled'):
+                        await self._cleanup_qr_client(client)
+                        return
+
+                    if attempt < max_refreshes - 1:
+                        self.log_message(f"📷 QR expired, refreshing... (attempt {attempt + 2}/{max_refreshes})")
+                        try:
+                            await qr_login.recreate()
+                            try:
+                                expires_in = max(0, int((qr_login.expires - datetime.now(timezone.utc)).total_seconds()))
+                            except Exception:
+                                expires_in = 30
+
+                            try:
+                                socketio.emit('qr_code_generated', {
+                                    'url': qr_login.url,
+                                    'expires_in': expires_in
+                                })
+                            except Exception:
+                                pass
+                        except Exception as recreate_err:
+                            self.log_message(f"❌ QR refresh failed: {str(recreate_err)}")
+                            break
+                    else:
+                        self.log_message("❌ QR login expired after all attempts")
+
+                except SessionPasswordNeededError:
+                    # 2FA required — pause and ask user for password
+                    self.log_message("🔐 2FA password required for QR login")
+                    auth['step'] = '2fa'
+                    try:
+                        socketio.emit('qr_2fa_required', {})
+                    except Exception:
+                        pass
+                    # Don't clean up — wait for submit_qr_password to continue
+                    return
+
+                except Exception as wait_err:
+                    error_str = str(wait_err)
+                    if 'SessionPasswordNeededError' in type(wait_err).__name__ or 'password' in error_str.lower():
+                        # 2FA required
+                        self.log_message("🔐 2FA password required for QR login")
+                        auth['step'] = '2fa'
+                        try:
+                            socketio.emit('qr_2fa_required', {})
+                        except Exception:
+                            pass
+                        return
+                    else:
+                        self.log_message(f"❌ QR wait error: {error_str}")
+                        break
+
+            # All attempts exhausted
+            self.log_message("❌ QR login failed: no scan detected")
+            try:
+                socketio.emit('qr_login_expired', {'error': 'QR code expired. Please try again.'})
+            except Exception:
+                pass
+            await self._cleanup_qr_client(client)
+
+        except asyncio.TimeoutError:
+            self.log_message("❌ QR login: connection timeout")
+            try:
+                socketio.emit('qr_login_error', {'error': 'Connection timeout. Check API credentials.'})
+            except Exception:
+                pass
+            if client:
+                await self._cleanup_qr_client(client)
+
+        except Exception as e:
+            error_msg = str(e)
+            self.log_message(f"❌ QR login error: {error_msg}")
+            try:
+                socketio.emit('qr_login_error', {'error': error_msg})
+            except Exception:
+                pass
+            if client:
+                await self._cleanup_qr_client(client)
+
+        finally:
+            # Only clear state if not waiting for 2FA
+            if self.pending_qr_auth.get('step') != '2fa':
+                self.pending_qr_auth = {}
+
+    async def _finalize_qr_login(self, client, user, auth):
+        """Complete QR login: save session, add account to DB, notify frontend."""
+        try:
+            phone = user.phone or f"qr_{user.id}"
+            if phone and not phone.startswith('+'):
+                phone = f"+{phone}"
+            display_name = auth.get('account_name') or user.first_name or phone
+
+            # Check if account already exists
+            existing = self.db.get_account_by_phone(phone)
+            if existing:
+                # Update existing account's session
+                session_str = client.session.save()
+                if session_str and len(session_str) > 10:
+                    self.db.update_account(phone, {
+                        'session_string': session_str,
+                        'status': 'Connected',
+                        'source_channel': auth['source_channel'],
+                        'target_channels': auth['target_channels']
+                    })
+                    self.log_message(f"💾 Updated existing account via QR: {phone}")
+                self.clients[phone] = client
+                self.accounts = self.load_accounts()
+                await self.preload_account_entities(client, phone)
+                try:
+                    socketio.emit('qr_login_success', {'phone': phone, 'name': display_name})
+                    socketio.emit('accounts_updated', self.get_accounts_data())
+                except Exception:
+                    pass
+                self.pending_qr_auth = {}
+                return
+
+            # Save session string
+            session_str = client.session.save()
+            session_name = f"session_{phone.replace('+', '').replace(' ', '').replace('-', '')}"
+
+            # Add new account to database
+            new_account_data = {
+                'api_id': auth['api_id'],
+                'api_hash': auth['api_hash'],
+                'phone': phone,
+                'account_name': display_name,
+                'source_channel': auth['source_channel'],
+                'target_channels': auth['target_channels'],
+                'status': 'Connected',
+                'session_file': session_name,
+                'session_string': session_str
+            }
+
+            self.db.add_account(new_account_data)
+            self.clients[phone] = client
+            self.accounts = self.load_accounts()
+
+            self.log_message(f"✅ QR Login complete! Account added: {display_name} ({phone})")
+            self.log_message(f"💾 Session saved to database (length: {len(session_str) if session_str else 0})")
+
+            # Preload entities
+            await self.preload_account_entities(client, phone)
+
+            try:
+                socketio.emit('qr_login_success', {'phone': phone, 'name': display_name})
+                socketio.emit('accounts_updated', self.get_accounts_data())
+            except Exception:
+                pass
+
+            self.pending_qr_auth = {}
+
+        except Exception as e:
+            self.log_message(f"❌ QR finalize error: {str(e)}")
+            try:
+                socketio.emit('qr_login_error', {'error': f'Account save failed: {str(e)}'})
+            except Exception:
+                pass
+            self.pending_qr_auth = {}
+
+    def submit_qr_password(self, password):
+        """Submit 2FA password for QR login."""
+        if not self.pending_qr_auth or self.pending_qr_auth.get('step') != '2fa':
+            return {"success": False, "error": "No QR login waiting for 2FA password"}
+
+        if not self.loop:
+            return {"success": False, "error": "Async loop not available"}
+
+        asyncio.run_coroutine_threadsafe(
+            self._process_qr_2fa(password),
+            self.loop
+        )
+        return {"success": True, "message": "2FA password submitted"}
+
+    async def _process_qr_2fa(self, password):
+        """Process 2FA password for QR login."""
+        auth = self.pending_qr_auth
+        client = auth.get('client')
+        if not client:
+            try:
+                socketio.emit('qr_login_error', {'error': 'Client not available'})
+            except Exception:
+                pass
+            self.pending_qr_auth = {}
+            return
+
+        try:
+            await client.sign_in(password=password)
+            user = await client.get_me()
+            self.log_message(f"✅ QR 2FA successful: {user.first_name}")
+            await self._finalize_qr_login(client, user, auth)
+
+        except Exception as e:
+            error_msg = str(e)
+            self.log_message(f"❌ QR 2FA error: {error_msg}")
+            
+            # If it's a password error, don't kill the client
+            if "password" in error_msg.lower() or "invalid" in error_msg.lower():
+                try:
+                    socketio.emit('qr_2fa_error', {'error': f'Incorrect password: {error_msg}'})
+                except Exception:
+                    pass
+                return
+                
+            try:
+                socketio.emit('qr_login_error', {'error': f'2FA failed: {error_msg}'})
+            except Exception:
+                pass
+            await self._cleanup_qr_client(client)
+            self.pending_qr_auth = {}
+
+    def reconnect_qr_account(self, phone):
+        """Initiate QR login for an existing account with broken session."""
+        account = self.db.get_account_by_phone(phone)
+        if not account:
+            return {"success": False, "error": "Account not found"}
+
+        # Start a new QR login flow using existing account data
+        self.pending_qr_auth = {
+            'step': 'qr',
+            'api_id': account.get('api_id'),
+            'api_hash': account.get('api_hash'),
+            'source_channel': account.get('source_channel'),
+            'target_channels': account.get('target_channels'),
+            'account_name': account.get('account_name'),
+            'client': None,
+            'qr_login': None,
+            'cancelled': False,
+            'reconnect_phone': phone # Optional flag to denote reconnect
+        }
+
+        self.log_message(f"📷 QR Reconnect started for {phone}")
+        asyncio.run_coroutine_threadsafe(self._qr_login_worker(), self.loop)
+        return {"success": True, "message": "QR login started for reconnect."}
+
+    def cancel_qr_login(self):
+        """Cancel an in-progress QR login."""
+        if not self.pending_qr_auth:
+            return {"success": False, "error": "No QR login in progress"}
+
+        self.pending_qr_auth['cancelled'] = True
+
+        # Clean up client if exists
+        client = self.pending_qr_auth.get('client')
+        if client and self.loop:
+            asyncio.run_coroutine_threadsafe(self._cleanup_qr_client(client), self.loop)
+
+        self.pending_qr_auth = {}
+        self.log_message("📷 QR login cancelled")
+        return {"success": True, "message": "QR login cancelled"}
+
+    async def _cleanup_qr_client(self, client):
+        """Safely disconnect a QR login client."""
+        try:
+            if client and client.is_connected():
+                await asyncio.wait_for(client.disconnect(), timeout=5.0)
+        except Exception:
+            pass
+
     def scan_all_posts(self):
         if not self.clients:
             return {"success": False, "error": "Connect to accounts first!"}
@@ -1459,19 +1809,30 @@ class WebTelegramForwarder:
         
         if not self.clients:
             return {"success": False, "error": "No accounts connected!"}
+
+        if self.scheduler_running and self.scheduler_task and not self.scheduler_task.done():
+            return {"success": True, "message": "Scheduler is already running."}
         
         self.scheduler_running = True
-        
-        asyncio.run_coroutine_threadsafe(self.run_scheduler(), self.loop)
+        self.scheduler_task = asyncio.run_coroutine_threadsafe(self.run_scheduler(), self.loop)
         
         pending_posts = [p for p in self.scheduled_posts if p['status'] == 'Pending']
         self.log_message(f"Scheduler started - {len(pending_posts)} pending posts")
         
         try:
             socketio.emit('scheduler_status', {'running': True})
-        except:
+        except Exception:
             pass
         return {"success": True, "message": f"Scheduler started - {len(pending_posts)} pending posts"}
+
+    def stop_scheduler(self):
+        self.scheduler_running = False
+        self.log_message("Scheduler stopped")
+        try:
+            socketio.emit('scheduler_status', {'running': False})
+        except Exception:
+            pass
+        return {"success": True, "message": "Scheduler stopped"}
     
     async def run_scheduler(self):
         utc_plus_2 = timezone(timedelta(hours=2))
@@ -1491,20 +1852,18 @@ class WebTelegramForwarder:
                         if isinstance(post_time, str):
                             try:
                                 post_time = datetime.fromisoformat(post_time)
-                            except:
+                            except Exception:
                                 try:
                                     post_time = datetime.strptime(post_time, '%Y-%m-%d %H:%M:%S')
-                                except:
+                                except Exception:
                                     self.log_message(f"Invalid datetime format for post {post['id']}: {post_time}")
                                     continue
 
-                        # Ensure timezone is set
+                        # Ensure timezone is set properly without double offset shift
                         if isinstance(post_time, datetime):
                             if post_time.tzinfo is None:
-                                # Assume UTC if no timezone, convert to UTC+2
-                                post_time = post_time.replace(tzinfo=timezone.utc).astimezone(utc_plus_2)
+                                post_time = post_time.replace(tzinfo=utc_plus_2)
                             else:
-                                # Convert to UTC+2 for comparison
                                 post_time = post_time.astimezone(utc_plus_2)
 
                         time_diff = (post_time - current_time).total_seconds()
@@ -1516,7 +1875,25 @@ class WebTelegramForwarder:
                 
                 if posts_to_send:
                     self.log_message(f"Found {len(posts_to_send)} posts ready to send")
-                    posts_to_send.sort(key=lambda x: x['datetime'] if isinstance(x['datetime'], datetime) else datetime.strptime(x['datetime'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=utc_plus_2))
+
+                    def _get_sort_dt(p):
+                        dt = p['datetime']
+                        if isinstance(dt, str):
+                            try:
+                                dt = datetime.fromisoformat(dt)
+                            except Exception:
+                                try:
+                                    dt = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
+                                except Exception:
+                                    dt = datetime.now(utc_plus_2)
+                        if isinstance(dt, datetime):
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=utc_plus_2)
+                            else:
+                                dt = dt.astimezone(utc_plus_2)
+                        return dt
+
+                    posts_to_send.sort(key=_get_sort_dt)
                     
                     for post in posts_to_send:
                         if self.scheduler_running:
@@ -1538,7 +1915,7 @@ class WebTelegramForwarder:
         self.log_message("Scheduler stopped")
         try:
             socketio.emit('scheduler_status', {'running': False})
-        except:
+        except Exception:
             pass
     
     async def send_scheduled_post(self, post):
@@ -1911,6 +2288,8 @@ forwarder = WebTelegramForwarder()
 def login_required(f):
     def decorated_function(*args, **kwargs):
         if 'authenticated' not in session or not session['authenticated']:
+            if request.path.startswith('/api/') or request.is_json:
+                return jsonify({'success': False, 'error': 'Unauthorized'}), 401
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__
@@ -1919,23 +2298,26 @@ def login_required(f):
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '').strip()
-        
-        print(f"Login attempt: username='{username}', password='{password}'")
+        json_data = request.get_json(silent=True) or {}
+        username = (json_data.get('username') or request.form.get('username', '')).strip()
+        password = (json_data.get('password') or request.form.get('password', '')).strip()
         
         if not username or not password:
-            print("Empty username or password")
+            if request.is_json:
+                return jsonify({'success': False, 'error': 'Please fill in all fields'}), 400
             return render_template('login.html', error='Please fill in all fields')
         
         if auth_manager.verify_credentials(username, password):
-            print("Login successful")
+            session.clear()
             session['authenticated'] = True
             session['username'] = username
             session.permanent = True
+            if request.is_json:
+                return jsonify({'success': True, 'message': 'Logged in successfully'})
             return redirect(url_for('index'))
         else:
-            print("Invalid credentials")
+            if request.is_json:
+                return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
             return render_template('login.html', error='Invalid username or password')
     
     if 'authenticated' in session and session['authenticated']:
@@ -1943,9 +2325,11 @@ def login():
     
     return render_template('login.html')
 
-@app.route('/logout')
+@app.route('/logout', methods=['GET', 'POST'])
 def logout():
     session.clear()
+    if request.is_json:
+        return jsonify({'success': True, 'message': 'Logged out successfully'})
     return redirect(url_for('login'))
 
 @app.route('/')
@@ -1953,7 +2337,7 @@ def logout():
 def index():
     return render_template('index.html')
 
-@app.route('/api/server-time')
+@app.route('/api/server-time', methods=['GET'])
 @login_required
 def get_server_time():
     utc_plus_2 = timezone(timedelta(hours=2))
@@ -1974,7 +2358,15 @@ def get_accounts():
 @app.route('/api/accounts', methods=['POST'])
 @login_required
 def add_account():
-    data = request.json
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({'success': False, 'error': 'Invalid or missing JSON payload'}), 400
+
+    required_keys = ['api_id', 'api_hash', 'phone', 'source_channel', 'target_channels']
+    for key in required_keys:
+        if key not in data:
+            return jsonify({'success': False, 'error': f'Missing required parameter: {key}'}), 400
+
     result = forwarder.add_account(
         data['api_id'],
         data['api_hash'],
@@ -1983,27 +2375,51 @@ def add_account():
         data['source_channel'],
         data['target_channels']
     )
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
 
 @app.route('/api/accounts/<phone>', methods=['DELETE'])
 @login_required
 def remove_account(phone):
     result = forwarder.remove_account(phone)
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 404
+    return jsonify(result), status_code
+
+@app.route('/api/accounts/<phone>', methods=['PUT'])
+@login_required
+def update_account(phone):
+    data = request.get_json(silent=True) or {}
+    result = forwarder.update_account_settings(
+        phone,
+        new_name=data.get('account_name'),
+        new_source=data.get('source_channel'),
+        new_targets=data.get('target_channels')
+    )
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
+
+@app.route('/api/accounts/<phone>/reconnect', methods=['POST'])
+@login_required
+def reconnect_account(phone):
+    result = forwarder.reconnect_qr_account(phone)
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
 
 @app.route('/api/channels/remove', methods=['POST'])
 @login_required
 def remove_channels():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     selected_channels = data.get('channels', {})
     result = forwarder.remove_selected_channels(selected_channels)
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
 
 @app.route('/api/connect', methods=['POST'])
 @login_required
 def connect_accounts():
     result = forwarder.connect_all_accounts()
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
 
 @app.route('/api/disconnect', methods=['POST'])
 @login_required
@@ -2019,22 +2435,67 @@ def get_auth_status():
 @app.route('/api/auth/code', methods=['POST'])
 @login_required
 def submit_auth_code():
-    data = request.json
+    data = request.get_json(silent=True)
+    if not data or 'phone' not in data or 'code' not in data:
+        return jsonify({'success': False, 'error': 'Phone and code are required'}), 400
     result = forwarder.submit_auth_code(data['phone'], data['code'])
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
 
 @app.route('/api/auth/password', methods=['POST'])
 @login_required
 def submit_auth_password():
-    data = request.json
+    data = request.get_json(silent=True)
+    if not data or 'phone' not in data or 'password' not in data:
+        return jsonify({'success': False, 'error': 'Phone and password are required'}), 400
     result = forwarder.submit_auth_password(data['phone'], data['password'])
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
+
+@app.route('/api/qr/start', methods=['POST'])
+@login_required
+def start_qr_login():
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({'success': False, 'error': 'Invalid or missing JSON payload'}), 400
+
+    required_keys = ['api_id', 'api_hash', 'source_channel', 'target_channels']
+    for key in required_keys:
+        if key not in data:
+            return jsonify({'success': False, 'error': f'Missing parameter: {key}'}), 400
+
+    result = forwarder.start_qr_login(
+        data['api_id'],
+        data['api_hash'],
+        data.get('account_name', ''),
+        data['source_channel'],
+        data['target_channels']
+    )
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
+
+@app.route('/api/qr/password', methods=['POST'])
+@login_required
+def submit_qr_password():
+    data = request.get_json(silent=True)
+    if not data or 'password' not in data:
+        return jsonify({'success': False, 'error': 'Password is required'}), 400
+    result = forwarder.submit_qr_password(data['password'])
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
+
+@app.route('/api/qr/cancel', methods=['POST'])
+@login_required
+def cancel_qr_login():
+    result = forwarder.cancel_qr_login()
     return jsonify(result)
 
 @app.route('/api/scan/posts', methods=['POST'])
 @login_required
 def scan_posts():
     result = forwarder.scan_all_posts()
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
 
 @app.route('/api/scan/ids', methods=['GET'])
 @login_required
@@ -2049,25 +2510,39 @@ def get_scheduled_posts():
 @app.route('/api/scheduled', methods=['POST'])
 @login_required
 def add_scheduled_post():
-    data = request.json
-    
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({'success': False, 'error': 'Invalid or missing JSON payload'}), 400
+
+    if 'post_ids' not in data or 'time_slots' not in data or 'channels' not in data:
+        return jsonify({'success': False, 'error': 'post_ids, time_slots, and channels are required'}), 400
+
     result = forwarder.add_scheduled_posts(
         data['post_ids'],
         data['time_slots'],
         data['channels']
     )
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
 
 @app.route('/api/scheduled/<int:post_id>', methods=['DELETE'])
 @login_required
 def remove_scheduled_post(post_id):
     result = forwarder.remove_scheduled_post(post_id)
-    return jsonify(result)
+    status_code = 200 if result.get('success', True) else 404
+    return jsonify(result), status_code
 
 @app.route('/api/scheduler/start', methods=['POST'])
 @login_required
 def start_scheduler():
     result = forwarder.start_scheduler()
+    status_code = 200 if result.get('success', True) else 400
+    return jsonify(result), status_code
+
+@app.route('/api/scheduler/stop', methods=['POST'])
+@login_required
+def stop_scheduler():
+    result = forwarder.stop_scheduler()
     return jsonify(result)
 
 @app.route('/api/logs/clear', methods=['POST'])
@@ -2092,9 +2567,9 @@ def get_log_history():
 def get_scan_history():
     return jsonify({"history": forwarder.get_scan_history()})
 
-@app.route('/health')
+@app.route('/health', methods=['GET'])
 def health():
-    return {"status": "healthy", "accounts": len(forwarder.accounts), "connected": len(forwarder.clients)}
+    return jsonify({"status": "healthy", "accounts": len(forwarder.accounts), "connected": len(forwarder.clients)})
 
 @socketio.on('connect')
 def handle_connect():
