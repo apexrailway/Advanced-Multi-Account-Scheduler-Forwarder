@@ -1652,7 +1652,7 @@ class WebTelegramForwarder:
             return {"success": False, "error": "No valid message IDs provided!"}
 
         utc_plus_2 = timezone(timedelta(hours=2))
-        current_time = datetime.now(utc_plus_2)
+        current_time = datetime.now(timezone.utc)
         
         created_posts = []
         
@@ -1674,7 +1674,9 @@ class WebTelegramForwarder:
                 slot_datetime = datetime.strptime(time_slot['datetime'], '%Y-%m-%dT%H:%M')
                 # User enters time in UTC+2, so we treat it as UTC+2
                 slot_datetime = slot_datetime.replace(tzinfo=utc_plus_2)
-                # Database will store this as-is (timezone aware)
+                # Convert to UTC before saving to DB to prevent double timezone conversion
+                # (psycopg2 converts tz-aware datetimes to UTC before storing in TIMESTAMP WITHOUT TIME ZONE)
+                slot_datetime = slot_datetime.astimezone(timezone.utc)
             except ValueError:
                 continue
 
@@ -1840,8 +1842,9 @@ class WebTelegramForwarder:
 
         while self.scheduler_running:
             try:
-                current_time = datetime.now(utc_plus_2)
-                self.log_message(f"Scheduler check at: {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC+2")
+                current_time = datetime.now(timezone.utc)
+                current_time_display = current_time.astimezone(utc_plus_2)
+                self.log_message(f"Scheduler check at: {current_time_display.strftime('%Y-%m-%d %H:%M:%S')} UTC+2")
 
                 posts_to_send = []
                 for post in self.scheduled_posts:
@@ -1859,15 +1862,16 @@ class WebTelegramForwarder:
                                     self.log_message(f"Invalid datetime format for post {post['id']}: {post_time}")
                                     continue
 
-                        # Ensure timezone is set properly without double offset shift
+                        # Naive datetimes from the database are stored in UTC
                         if isinstance(post_time, datetime):
                             if post_time.tzinfo is None:
-                                post_time = post_time.replace(tzinfo=utc_plus_2)
+                                post_time = post_time.replace(tzinfo=timezone.utc)
                             else:
-                                post_time = post_time.astimezone(utc_plus_2)
+                                post_time = post_time.astimezone(timezone.utc)
 
                         time_diff = (post_time - current_time).total_seconds()
-                        self.log_message(f"Post {post['id']}: scheduled for {post_time.strftime('%Y-%m-%d %H:%M:%S')} UTC+2, time diff: {time_diff:.0f} seconds")
+                        post_time_display = post_time.astimezone(utc_plus_2)
+                        self.log_message(f"Post {post['id']}: scheduled for {post_time_display.strftime('%Y-%m-%d %H:%M:%S')} UTC+2, time diff: {time_diff:.0f} seconds")
 
                         if time_diff <= 0:
                             posts_to_send.append(post)
@@ -1885,12 +1889,12 @@ class WebTelegramForwarder:
                                 try:
                                     dt = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
                                 except Exception:
-                                    dt = datetime.now(utc_plus_2)
+                                    dt = datetime.now(timezone.utc)
                         if isinstance(dt, datetime):
                             if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=utc_plus_2)
+                                dt = dt.replace(tzinfo=timezone.utc)
                             else:
-                                dt = dt.astimezone(utc_plus_2)
+                                dt = dt.astimezone(timezone.utc)
                         return dt
 
                     posts_to_send.sort(key=_get_sort_dt)
@@ -2095,7 +2099,7 @@ class WebTelegramForwarder:
             try:
                 update_data = {
                     'status': new_status,
-                    'sent_at': datetime.now(timezone(timedelta(hours=2)))
+                    'sent_at': datetime.now(timezone.utc)
                 }
                 if error_message:
                     update_data['error_message'] = error_message
